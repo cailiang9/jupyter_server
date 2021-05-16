@@ -41,10 +41,11 @@ except ImportError:
 
 _script_exporter = None
 
-
+tooslowmsg = 'filesystem-too-slow-or-too-many-files'
 class FileContentsManager(FileManagerMixin, ContentsManager):
 
     root_dir = Unicode(config=True)
+    fast_model = False
 
     @default('root_dir')
     def _default_root_dir(self):
@@ -195,10 +196,15 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         os_path = self._get_os_path(path=path)
         return exists(os_path)
 
+    def lstat(self, path):
+        if self.fast_model or tooslowmsg in path:
+            return os.stat_result((0,0,0,0,0,0,0,0,0,0))
+        return os.lstat(path)
+
     def _base_model(self, path):
         """Build the common base of a contents model"""
         os_path = self._get_os_path(path)
-        info = os.lstat(os_path)
+        info = self.lstat(os_path)
 
         try:
             # size of file
@@ -233,6 +239,9 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         model['format'] = None
         model['mimetype'] = None
         model['size'] = size
+        if self.fast_model:
+            model['writable'] = True
+            return model
 
         try:
             model['writable'] = os.access(os_path, os.W_OK)
@@ -242,6 +251,7 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         return model
 
     def _dir_model(self, path, content=True):
+        import time
         """Build a model for a directory
 
         if content is requested, will include a listing of the directory
@@ -264,7 +274,25 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         if content:
             model['content'] = contents = []
             os_dir = self._get_os_path(path)
-            for name in os.listdir(os_dir):
+            sttime = time.time()
+            for ifile, fentry in enumerate(os.scandir(os_dir)):
+                name = fentry.name
+                if time.time() - sttime > 3 or len(contents) >= 2048:
+                    self.log.warning(f"{tooslowmsg} in {os_dir}")
+                    self.fast_model = True
+                    contents.append(
+                            self.get(path='%s/%s' % (path, tooslowmsg), content=False)
+                    )
+                    break
+                if time.time() - sttime > 1:
+                    self.fast_model = True
+                    if self.should_list(name):
+                        if self.allow_hidden or not fentry.name.startswith('.'): # not is_file_hidden(os_path, stat_res=st):
+                            contents.append(
+                                    self.get(path='%s/%s' % (path, name), content=False)
+                            )
+                    continue
+
                 try:
                     os_path = os.path.join(os_dir, name)
                 except UnicodeDecodeError as e:
@@ -273,7 +301,7 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
                     continue
 
                 try:
-                    st = os.lstat(os_path)
+                    st = self.lstat(os_path)
                 except OSError as e:
                     # skip over broken symlinks in listing
                     if e.errno == errno.ENOENT:
@@ -304,7 +332,7 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
                         )
 
             model['format'] = 'json'
-
+            self.fast_model = False
         return model
 
     def _file_model(self, path, content=True, format=None):
@@ -382,7 +410,7 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         """
         path = path.strip('/')
 
-        if not self.exists(path):
+        if not self.fast_model and tooslowmsg not in path and not self.exists(path):
             raise web.HTTPError(404, u'No such file or directory: %s' % path)
 
         os_path = self._get_os_path(path)
@@ -555,16 +583,28 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
             parent_dir = ''
         return parent_dir
 
+def _scandir(path):
+    import time
+    sttime = time.time()
+    contents = []
+    for fentry in os.scandir(path):
+        spent_time = time.time() - sttime
+        if spent_time > 2 or len(contents) >= 2048:
+            break
+        contents.append((fentry, spent_time))
+    return contents
+
 class AsyncFileContentsManager(FileContentsManager, AsyncFileManagerMixin, AsyncContentsManager):
     @default('checkpoints_class')
     def _checkpoints_class_default(self):
         return AsyncFileCheckpoints
-
+        
     async def _dir_model(self, path, content=True):
         """Build a model for a directory
 
         if content is requested, will include a listing of the directory
         """
+        import time
         os_path = self._get_os_path(path)
 
         four_o_four = u'directory does not exist: %r' % path
@@ -583,8 +623,25 @@ class AsyncFileContentsManager(FileContentsManager, AsyncFileManagerMixin, Async
         if content:
             model['content'] = contents = []
             os_dir = self._get_os_path(path)
-            dir_contents = await run_sync(os.listdir, os_dir)
-            for name in dir_contents:
+            sttime = time.time()
+            for ifile, (fentry, _) in enumerate(await run_sync(_scandir, os_dir)):
+                spent_time = time.time() - sttime
+                name = fentry.name
+                if spent_time > 2 or len(contents) >= 2048:
+                    self.log.warning(f"{tooslowmsg} in {os_dir}")
+                    self.fast_model = True
+                    contents.append(
+                            await self.get(path='%s/%s' % (path, tooslowmsg), content=False)
+                    )
+                    break
+                if spent_time > 1:
+                    self.fast_model = True
+                    if self.should_list(name):
+                        if self.allow_hidden or not fentry.name.startswith('.'): # not is_file_hidden(os_path, stat_res=st):
+                            contents.append(
+                                    await self.get(path='%s/%s' % (path, name), content=False)
+                            )
+                    continue
                 try:
                     os_path = os.path.join(os_dir, name)
                 except UnicodeDecodeError as e:
@@ -624,7 +681,7 @@ class AsyncFileContentsManager(FileContentsManager, AsyncFileManagerMixin, Async
                         )
 
             model['format'] = 'json'
-
+            self.fast_model = False
         return model
 
     async def _file_model(self, path, content=True, format=None):
@@ -702,7 +759,7 @@ class AsyncFileContentsManager(FileContentsManager, AsyncFileManagerMixin, Async
         """
         path = path.strip('/')
 
-        if not self.exists(path):
+        if not self.fast_model and tooslowmsg not in path and not self.exists(path):
             raise web.HTTPError(404, u'No such file or directory: %s' % path)
 
         os_path = self._get_os_path(path)
